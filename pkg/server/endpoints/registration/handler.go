@@ -13,8 +13,8 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/sirupsen/logrus"
+	"github.com/spiffe/spire/pkg/common/auth"
 	"github.com/spiffe/spire/pkg/common/idutil"
-	"github.com/spiffe/spire/pkg/common/peertracker"
 	"github.com/spiffe/spire/pkg/common/telemetry"
 	telemetry_common "github.com/spiffe/spire/pkg/common/telemetry/common"
 	telemetry_registrationapi "github.com/spiffe/spire/pkg/common/telemetry/server/registrationapi"
@@ -840,11 +840,15 @@ func (h *Handler) prepareRegistrationEntry(entry *common.RegistrationEntry, forU
 	return entry, nil
 }
 
-func (h *Handler) AuthorizeCall(ctx context.Context, fullMethod string) (context.Context, error) {
+func (h *Handler) AuthorizeCall(ctx context.Context, fullMethod string) (_ context.Context, err error) {
 	// For the time being, authorization is not per-method. In other words, all or nothing.
+	counter := telemetry_registrationapi.StartAuthorizeCall(h.Metrics, fullMethod)
+	defer counter.Done(&err)
+	log := h.Log.WithField(telemetry.Method, fullMethod)
+
 	callerID, err := authorizeCaller(ctx, h.getDataStore())
 	if err != nil {
-		h.Log.WithError(err).Error("Failed to authorize caller")
+		log.WithError(err).Error("Failed to authorize caller")
 		return nil, err
 	}
 	if callerID != "" {
@@ -903,7 +907,7 @@ func authorizeCaller(ctx context.Context, ds datastore.DataStore) (spiffeID stri
 		if err != nil {
 			return "", status.Error(codes.PermissionDenied, err.Error())
 		}
-	case peertracker.AuthInfo:
+	case auth.UntrackedUDSAuthInfo:
 		// The caller came over UDS and is therefore authorized but does not
 		// provide a spiffeID. The file permissions on the UDS are restricted to
 		// processes belonging to the same user or group as the server.

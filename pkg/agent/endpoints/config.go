@@ -23,8 +23,11 @@ type Config struct {
 	Log     logrus.FieldLogger
 	Metrics telemetry.Metrics
 
-	// If true, an SDS server will be served over the UDS socket
-	EnableSDS bool
+	// The TLS Certificate resource name to use for the default X509-SVID with Envoy SDS
+	DefaultSVIDName string
+
+	// The Validation Context resource name to use for the default X.509 bundle with Envoy SDS
+	DefaultBundleName string
 }
 
 func New(c *Config) *Endpoints {

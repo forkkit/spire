@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +42,6 @@ const (
 	defaultTokenPath         = "/run/secrets/kubernetes.io/serviceaccount/token" //nolint: gosec // false positive
 	defaultNodeNameEnv       = "MY_NODE_NAME"
 	defaultReloadInterval    = time.Minute
-	kubePodsPrefix           = "/kubepods"
 )
 
 type containerLookup int
@@ -321,31 +322,7 @@ func (p *Plugin) getContainerIDFromCGroups(pid int32) (string, error) {
 		return "", k8sErr.Wrap(err)
 	}
 
-	for _, cgroup := range cgroups {
-		// We are only interested in kube pods entries. Example entries:
-		// 11:hugetlb:/kubepods/burstable/pod2c48913c-b29f-11e7-9350-020968147796/9bca8d63d5fa610783847915bcff0ecac1273e5b4bed3f6fa1b07350e0135961
-		// 12:pids:/docker/8d461fa5765781bcf5f7eb192f101bc3103d4b932e26236f43feecfa20664f96/kubepods/besteffort/poddaa5c7ee-3484-4533-af39-3591564fd03e/aff34703e5e1f89443e9a1bffcc80f43f74d4808a2dd22c8f88c08547b323934
-		groupPath := cgroup.GroupPath
-		idx := strings.Index(groupPath, kubePodsPrefix)
-		if idx == -1 {
-			continue
-		}
-
-		parts := strings.Split(groupPath[idx:], "/")
-		if len(parts) < 5 {
-			log.Printf("Kube pod entry found, but without container id: %s", cgroup.GroupPath)
-			continue
-		}
-		id := strings.TrimSuffix(parts[4], ".scope")
-		// Trim the id of any container runtime prefixes. Ex "docker-" or "crio-"
-		dash := strings.Index(id, "-")
-		if dash > -1 {
-			id = id[dash+1:]
-		}
-		return id, nil
-	}
-
-	return "", nil
+	return getContainerIDFromCGroups(cgroups)
 }
 
 func (p *Plugin) reloadKubeletClient(config *k8sConfig) (err error) {
@@ -554,6 +531,60 @@ func (c *kubeletClient) GetPodList() (*corev1.PodList, error) {
 	return out, nil
 }
 
+func getContainerIDFromCGroups(cgroups []cgroups.Cgroup) (string, error) {
+	var containerID string
+	for _, cgroup := range cgroups {
+		candidate, ok := getContainerIDFromCGroupPath(cgroup.GroupPath)
+		switch {
+		case !ok:
+			// Cgroup did not contain a container ID.
+			continue
+		case containerID == "":
+			// This is the first container ID found so far.
+			containerID = candidate
+		case containerID != candidate:
+			// More than one container ID found in the cgroups.
+			return "", k8sErr.New("multiple container IDs found in cgroups (%s, %s)",
+				containerID, candidate)
+		}
+	}
+
+	return containerID, nil
+}
+
+// containerIDRe is the regex used to parse out the container ID from a cgroup
+// name. It assumes that any ".scope" suffix has been trimmed off beforehand.
+var containerIDRe = regexp.MustCompile(`` +
+	// "kubepods" surrounded by punctuation
+	`[[:punct:]]kubepods[[:punct:]]` +
+	// zero or more punctuation separated "segments" (e.g. "burstable-")
+	`(?:[[:^punct:]]+[[:punct:]])*` +
+	// "pod"-prefixed Pod UUID (with punctuation separated groups) followed by punctuation
+	`pod[[:xdigit:]]{8}[[:punct:]][[:xdigit:]]{4}[[:punct:]][[:xdigit:]]{4}[[:punct:]][[:xdigit:]]{4}[[:punct:]][[:xdigit:]]{12}[[:punct:]]` +
+	// zero or more punctuation separated "segments" (e.g. "docker-")
+	`(?:[[:^punct:]]+[[:punct:]])*` +
+	// non-punctuation end of string, i.e., the container ID
+	`([[:^punct:]]+)$`)
+
+func getContainerIDFromCGroupPath(cgroupPath string) (string, bool) {
+	// We are only interested in kube pods entries, for example:
+	// - /kubepods/burstable/pod2c48913c-b29f-11e7-9350-020968147796/9bca8d63d5fa610783847915bcff0ecac1273e5b4bed3f6fa1b07350e0135961
+	// - /docker/8d461fa5765781bcf5f7eb192f101bc3103d4b932e26236f43feecfa20664f96/kubepods/besteffort/poddaa5c7ee-3484-4533-af39-3591564fd03e/aff34703e5e1f89443e9a1bffcc80f43f74d4808a2dd22c8f88c08547b323934
+	// - /kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod2c48913c-b29f-11e7-9350-020968147796.slice/docker-9bca8d63d5fa610783847915bcff0ecac1273e5b4bed3f6fa1b07350e0135961.scope
+	// - /kubepods-besteffort-pod72f7f152_440c_66ac_9084_e0fc1d8a910c.slice:cri-containerd:b2a102854b4969b2ce98dc329c86b4fb2b06e4ad2cc8da9d8a7578c9cd2004a2"
+
+	// First trim off any .scope suffix. This allows for a cleaner regex since
+	// we don't have to muck with greediness. TrimSuffix is no-copy so this
+	// is cheap.
+	cgroupPath = strings.TrimSuffix(cgroupPath, ".scope")
+
+	matches := containerIDRe.FindStringSubmatch(cgroupPath)
+	if matches != nil {
+		return matches[1], true
+	}
+	return "", false
+}
+
 func lookUpContainerInPod(containerID string, status corev1.PodStatus) (*corev1.ContainerStatus, containerLookup) {
 	for _, status := range status.ContainerStatuses {
 		// TODO: should we be keying off of the status or is the lack of a
@@ -594,7 +625,20 @@ func lookUpContainerInPod(containerID string, status corev1.PodStatus) (*corev1.
 	return nil, containerNotInPod
 }
 
+func getPodImages(containerStatusArray []corev1.ContainerStatus) map[string]bool {
+	podImages := make(map[string]bool)
+
+	// collect container images
+	for _, status := range containerStatusArray {
+		podImages[status.ImageID] = true
+	}
+	return podImages
+}
+
 func getSelectorsFromPodInfo(pod *corev1.Pod, status *corev1.ContainerStatus) []*common.Selector {
+	podImages := getPodImages(pod.Status.ContainerStatuses)
+	podInitImages := getPodImages(pod.Status.InitContainerStatuses)
+
 	selectors := []*common.Selector{
 		makeSelector("sa:%s", pod.Spec.ServiceAccountName),
 		makeSelector("ns:%s", pod.Namespace),
@@ -603,6 +647,14 @@ func getSelectorsFromPodInfo(pod *corev1.Pod, status *corev1.ContainerStatus) []
 		makeSelector("pod-name:%s", pod.Name),
 		makeSelector("container-name:%s", status.Name),
 		makeSelector("container-image:%s", status.Image),
+		makeSelector("pod-image-count:%s", strconv.Itoa(len(podImages))),
+		makeSelector("pod-init-image-count:%s", strconv.Itoa(len(podInitImages))),
+	}
+	for podImage := range podImages {
+		selectors = append(selectors, makeSelector("pod-image:%s", podImage))
+	}
+	for podInitImage := range podInitImages {
+		selectors = append(selectors, makeSelector("pod-init-image:%s", podInitImage))
 	}
 
 	for k, v := range pod.Labels {
